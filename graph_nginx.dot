@@ -1,0 +1,8 @@
+digraph G {
+  rankdir=TB;
+  node [shape=box, style=filled, fontname=Arial, fontsize=12];
+  graph [label="Граф зависимостей пакета \"nginx\"", labelloc=t, fontsize=16, fontname=Arial];
+  "nginx" [fillcolor="#D5E8D4", penwidth=1.5, tooltip="nginx\nВерсия: 1.18.0-6ubuntu14", label="nginx"];
+  "nginx-core" [fillcolor="#DAE8FC", penwidth=1.5, tooltip="nginx-core\nВерсия: 1.18.0-6ubuntu14", label="nginx-core"];
+  "nginx" -> "nginx-core" [style=solid, color="#333333", arrowsize=0.8];
+}

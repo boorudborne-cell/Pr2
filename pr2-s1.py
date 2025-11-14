@@ -8,225 +8,238 @@ import os
 import re
 
 def fetch_packages_data(repo_url):
-    """Загрузка и распаковка файла Packages из репозитория"""
+    """Загрузка данных репозитория"""
     try:
-        # Обработка локальных путей
         if repo_url.startswith(('http://', 'https://')):
-            with urllib.request.urlopen(repo_url, timeout=10) as response:
+            headers = {'User-Agent': 'Mozilla/5.0 (Ubuntu)'}
+            req = urllib.request.Request(repo_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as response:
                 content = response.read()
-                content_type = response.headers.get('Content-Type', '')
-                content_encoding = response.headers.get('Content-Encoding', '')
         else:
-            # Локальный файл
             if not os.path.exists(repo_url):
                 raise FileNotFoundError(f"Файл не найден: {repo_url}")
-            
             with open(repo_url, 'rb') as f:
                 content = f.read()
-            
-            # Определяем тип сжатия по расширению
-            if repo_url.endswith('.gz'):
-                content_type = 'application/gzip'
-            elif repo_url.endswith('.bz2'):
-                content_type = 'application/x-bzip2'
-            else:
-                content_type = 'text/plain'
-            content_encoding = ''
         
-        # Распаковка данных
-        if '.gz' in repo_url or 'gzip' in content_type.lower() or 'gzip' in content_encoding.lower():
+        # Автоматическая распаковка
+        if repo_url.endswith('.gz') or b'\x1f\x8b' == content[:2]:
             return gzip.decompress(content).decode('utf-8', errors='ignore')
-        elif '.bz2' in repo_url or 'bzip2' in content_type.lower() or 'bzip2' in content_encoding.lower():
+        elif repo_url.endswith('.bz2') or b'BZh' == content[:3]:
             return bz2.decompress(content).decode('utf-8', errors='ignore')
         else:
             return content.decode('utf-8', errors='ignore')
     
     except Exception as e:
-        raise RuntimeError(f"Ошибка загрузки данных из репозитория: {str(e)}")
+        raise RuntimeError(f"Ошибка загрузки данных: {str(e)}")
 
-def parse_packages_data(packages_data, target_package, target_version):
-    """Парсинг данных о пакетах и поиск зависимостей"""
-    current_block = {}
+def parse_packages_index(packages_data):
+    """Парсинг индекса пакетов в словарь"""
+    packages = {}
     blocks = re.split(r'\n\s*\n', packages_data.strip())
     
     for block in blocks:
+        pkg_info = {}
         lines = block.split('\n')
-        package = None
-        version = None
-        depends = None
-        architecture = None
-        
         for line in lines:
-            if not line.strip():
-                continue
-                
             if ':' in line:
                 key, value = line.split(':', 1)
-                key = key.strip()
-                value = value.strip()
-                
-                if key == 'Package':
-                    package = value
-                elif key == 'Version':
-                    version = value
-                elif key == 'Depends':
-                    depends = value
-                elif key == 'Architecture':
-                    architecture = value
+                pkg_info[key.strip()] = value.strip()
         
-        # Сохраняем данные о пакете
-        if package and version:
-            # Создаем уникальный ключ с архитектурой для избежания коллизий
-            pkg_key = f"{package}:{architecture}" if architecture else package
-            
-            if pkg_key not in current_block:
-                current_block[pkg_key] = []
-            
-            current_block[pkg_key].append({
-                'version': version,
-                'depends': depends,
-                'architecture': architecture
-            })
+        if 'Package' in pkg_info and 'Version' in pkg_info:
+            pkg_key = f"{pkg_info['Package']}:{pkg_info.get('Architecture', 'all')}"
+            packages[pkg_key] = pkg_info
     
-    # Формируем ключ для поиска
-    search_key = f"{target_package}:amd64"  # Стандартная архитектура для Ubuntu
-    
-    # Ищем пакет
-    if search_key in current_block:
-        pkg_versions = current_block[search_key]
-    elif target_package in current_block:
-        pkg_versions = current_block[target_package]
-    else:
-        available_packages = [pkg.split(':')[0] for pkg in current_block.keys()]
-        raise ValueError(
-            f"Пакет '{target_package}' не найден в репозитории. "
-            f"Доступные пакеты (примеры): {', '.join(available_packages[:5])}..."
-        )
-    
-    # Ищем точное совпадение версии
-    for pkg_data in pkg_versions:
-        if pkg_data['version'] == target_version:
-            return pkg_data.get('depends', '')
-    
-    # Ищем частичное совпадение (на случай если указана не полная версия)
-    for pkg_data in pkg_versions:
-        if target_version in pkg_data['version']:
-            return pkg_data.get('depends', '')
-    
-    # Если не найдено, показываем доступные версии
-    available_versions = [pkg['version'] for pkg in pkg_versions]
-    raise ValueError(
-        f"Версия '{target_version}' пакета '{target_package}' не найдена. "
-        f"Доступные версии: {', '.join(available_versions[:5])}..."
-    )
+    return packages
 
-def extract_dependencies(depends_string):
-    """Извлечение списка зависимостей из строки Depends"""
-    if not depends_string:
+def extract_direct_dependencies(depends_field):
+    """Извлечение прямых зависимостей из поля Depends"""
+    if not depends_field:
         return []
     
-    dependencies = set()  # Используем set для уникальности
+    dependencies = []
+    for dep_group in depends_field.split(','):
+        alternatives = [alt.strip().split()[0] for alt in dep_group.split('|') if alt.strip()]
+        if alternatives:
+            dependencies.append(alternatives[0])  # Берем первый вариант из альтернатив
+    return list(set(dependencies))  # Убираем дубликаты
+
+def load_test_graph(file_path):
+    """Загрузка тестового графа из файла"""
+    graph = {}
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if ':' not in line:
+                    continue
+                
+                package, deps = line.split(':', 1)
+                package = package.strip().upper()
+                deps_list = [dep.strip().upper() for dep in deps.split(',') if dep.strip()]
+                graph[package] = deps_list
+        return graph
+    except Exception as e:
+        raise RuntimeError(f"Ошибка загрузки тестового графа: {str(e)}")
+
+def dfs_build_graph(package, graph, filter_substring, visited=None, current_path=None, result=None):
+    """Построение графа зависимостей с DFS и обнаружением циклов"""
+    if visited is None:
+        visited = set()
+    if current_path is None:
+        current_path = []
+    if result is None:
+        result = {}
     
-    # Разделяем по запятым и обрабатываем каждую зависимость
-    for dep_group in depends_string.split(','):
-        dep_group = dep_group.strip()
-        if not dep_group:
-            continue
-        
-        # Обрабатываем альтернативные зависимости (разделенные |)
-        alternatives = dep_group.split('|')
-        for alt in alternatives:
-            alt = alt.strip()
-            if not alt:
-                continue
-            
-            # Извлекаем имя пакета (до первого пробела или скобки)
-            dep_name = re.split(r'[ (]', alt)[0].strip()
-            
-            # Пропускаем виртуальные пакеты и некорректные имена
-            if dep_name and not dep_name.startswith('<') and not dep_name.endswith('>'):
-                dependencies.add(dep_name)
+    # Фильтрация по подстроке
+    if filter_substring and filter_substring in package:
+        return result
     
-    return sorted(list(dependencies))
+    # Проверка цикла
+    if package in current_path:
+        cycle_path = ' -> '.join(current_path + [package])
+        raise RuntimeError(f"Обнаружена циклическая зависимость: {cycle_path}")
+    
+    # Пропускаем уже обработанные пакеты
+    if package in visited:
+        return result
+    
+    visited.add(package)
+    current_path.append(package)
+    
+    # Инициализация узла в графе
+    if package not in result:
+        result[package] = []
+    
+    # Обработка зависимостей
+    dependencies = graph.get(package, [])
+    for dep in dependencies:
+        # Рекурсивный вызов для транзитивных зависимостей
+        dfs_build_graph(dep, graph, filter_substring, visited, current_path, result)
+        # Добавление ребра в граф
+        if dep not in filter_substring:
+            result[package].append(dep)
+    
+    current_path.pop()
+    return result
+
+def print_dependency_graph(graph, root_package):
+    """Вывод графа зависимостей в текстовом формате"""
+    def print_node(package, indent="", visited=None):
+        if visited is None:
+            visited = set()
+        if package in visited:
+            return
+        visited.add(package)
+        print(f"{indent}{package}")
+        for dep in graph.get(package, []):
+            print_node(dep, indent + "  ├── ", visited)
+    
+    print(f"\nГРАФ ЗАВИСИМОСТЕЙ ДЛЯ {root_package}:")
+    print_node(root_package)
+    print("\nСтруктура графа (ребра):")
+    for pkg, deps in graph.items():
+        if deps:
+            print(f"{pkg} -> {', '.join(deps)}")
 
 def validate_arguments(args):
-    """Валидация параметров с обработкой ошибок"""
+    """Валидация аргументов"""
     errors = []
     
-    if not args.version:
-        errors.append("Ошибка: Для этого этапа обязательным является параметр --version")
+    if args.mode == 'test' and not os.path.exists(args.repo_url):
+        errors.append(f"Ошибка: Тестовый файл не найден: {args.repo_url}")
     
-    # Валидация URL/пути репозитория
-    if not args.repo_url.startswith(('http://', 'https://', 'file://')) and not os.path.exists(args.repo_url):
-        errors.append("Ошибка: Некорректный URL/путь репозитория (--repo_url). "
-                      "Должен быть действительным URL или существующим локальным файлом")
+    if not args.mode == 'test' and not args.version:
+        errors.append("Ошибка: Для реального режима требуется указать --version")
     
     return errors
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Анализ зависимостей пакетов Ubuntu',
+        description='Построение графа зависимостей пакетов',
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False
     )
     
-    # Отдельная обработка справки
+    # Обработка справки
     if '-h' in sys.argv or '--help' in sys.argv:
-        print("Использование: app.py --package_name <имя> --repo_url <url/путь> --version <версия> [--mode <режим>]")
+        print("Использование: app.py --package_name <имя> --repo_url <url/путь> [--version <версия>] --mode <режим> [--filter_substring <подстрока>]")
         print("\nОбязательные параметры:")
-        print("  --package_name <имя>    Имя анализируемого пакета")
-        print("  --repo_url <url/путь>   URL репозитория или путь к файлу Packages")
-        print("  --version <версия>      Версия пакета в формате Ubuntu (например: 1.18.0-6ubuntu14.4)")
+        print("  --package_name <имя>          Имя корневого пакета")
+        print("  --repo_url <url/путь>         URL репозитория или путь к файлу")
+        print("  --mode <режим>                Режим работы:\n"
+              "                                  download - реальный репозиторий\n"
+              "                                  test - тестовый файл с графом")
         print("\nДополнительные параметры:")
-        print("  --mode <режим>          Режим работы (clone/download/local) - для совместимости с предыдущими этапами")
-        print("  -h, --help              Показать эту справку")
+        print("  --version <версия>            Версия пакета (только для реального режима)")
+        print("  --filter_substring <строка>   Исключить пакеты, содержащие подстроку")
+        print("  -h, --help                    Показать справку")
         sys.exit(0)
     
-    # Определение параметров
+    # Аргументы
     parser.add_argument('--package_name', type=str, required=True)
     parser.add_argument('--repo_url', type=str, required=True)
-    parser.add_argument('--version', type=str, required=True)
-    parser.add_argument('--mode', type=str, choices=['clone', 'download', 'local'], default='download')
+    parser.add_argument('--mode', type=str, choices=['download', 'test'], required=True)
+    parser.add_argument('--version', type=str)
+    parser.add_argument('--filter_substring', type=str, default='')
     
-    # Парсинг аргументов
+    # Парсинг
     try:
         args = parser.parse_args()
     except SystemExit:
-        print("\n!!! ИСПОЛЬЗОВАНИЕ ПРОГРАММЫ !!!")
         parser.print_help()
         sys.exit(1)
     
     # Валидация
     errors = validate_arguments(args)
     if errors:
-        print("\nОБНАРУЖЕНЫ ОШИБКИ В ПАРАМЕТРАХ:")
+        print("\nОШИБКИ В ПАРАМЕТРАХ:")
         for error in errors:
             print(f"- {error}")
         sys.exit(1)
     
     try:
-        # Загрузка данных из репозитория
-        print(f"\n[+] Загрузка данных из: {args.repo_url}")
-        packages_data = fetch_packages_data(args.repo_url)
-        
-        # Поиск зависимостей
-        print(f"[+] Поиск пакета '{args.package_name}' версии '{args.version}'")
-        depends_field = parse_packages_data(packages_data, args.package_name, args.version)
-        
-        # Извлечение зависимостей
-        dependencies = extract_dependencies(depends_field)
-        
-        # Вывод результатов
-        print(f"\nНАЙДЕНЫ ЗАВИСИМОСТИ ДЛЯ {args.package_name} (версия {args.version}):")
-        if dependencies:
-            print("\nПрямые зависимости:")
-            for i, dep in enumerate(dependencies, 1):
-                print(f"{i}. {dep}")
+        # Загрузка данных в зависимости от режима
+        if args.mode == 'test':
+            print(f"[+] Загрузка тестового графа из: {args.repo_url}")
+            package_graph = load_test_graph(args.repo_url)
+            root_package = args.package_name.upper()
         else:
-            print("Прямые зависимости отсутствуют")
+            print(f"[+] Загрузка данных из: {args.repo_url}")
+            packages_data = fetch_packages_data(args.repo_url)
+            packages_index = parse_packages_index(packages_data)
+            
+            # Поиск пакета
+            pkg_key = f"{args.package_name}:amd64"
+            if pkg_key not in packages_index and args.package_name in packages_index:
+                pkg_key = args.package_name
+            
+            if pkg_key not in packages_index:
+                raise ValueError(f"Пакет '{args.package_name}' не найден в репозитории")
+            
+            package_info = packages_index[pkg_key]
+            if args.version and package_info['Version'] != args.version:
+                raise ValueError(f"Версия '{args.version}' не найдена. Доступна: {package_info['Version']}")
+            
+            # Построение графа зависимостей
+            package_graph = {}
+            direct_deps = extract_direct_dependencies(package_info.get('Depends', ''))
+            package_graph[args.package_name] = direct_deps
+            
+            root_package = args.package_name
         
-        print(f"\nВсего найдено прямых зависимостей: {len(dependencies)}")
-        print(f"\nПоле Depends: {depends_field or 'отсутствует'}")
+        # Построение полного графа с DFS
+        print(f"[+] Построение графа зависимостей для {root_package}")
+        full_graph = dfs_build_graph(
+            root_package,
+            package_graph,
+            args.filter_substring
+        )
+        
+        # Вывод результата
+        print_dependency_graph(full_graph, root_package)
+        print(f"\nГраф успешно построен! Всего узлов: {len(full_graph)}")
     
     except Exception as e:
         print(f"\nКРИТИЧЕСКАЯ ОШИБКА: {str(e)}")

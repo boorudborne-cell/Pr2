@@ -6,12 +6,13 @@ import gzip
 import bz2
 import os
 import re
+from collections import deque
 
 def fetch_packages_data(repo_url):
     """Загрузка данных репозитория"""
     try:
         if repo_url.startswith(('http://', 'https://')):
-            headers = {'User-Agent': 'Mozilla/5.0 (Ubuntu)'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Ubuntu) apt/2.4.9'}
             req = urllib.request.Request(repo_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as response:
                 content = response.read()
@@ -93,7 +94,7 @@ def dfs_build_graph(package, graph, filter_substring, visited=None, current_path
         result = {}
     
     # Фильтрация по подстроке
-    if filter_substring and filter_substring in package:
+    if filter_substring and filter_substring.lower() in package.lower():
         return result
     
     # Проверка цикла
@@ -118,30 +119,87 @@ def dfs_build_graph(package, graph, filter_substring, visited=None, current_path
         # Рекурсивный вызов для транзитивных зависимостей
         dfs_build_graph(dep, graph, filter_substring, visited, current_path, result)
         # Добавление ребра в граф
-        if dep not in filter_substring:
+        if not (filter_substring and filter_substring.lower() in dep.lower()):
             result[package].append(dep)
     
     current_path.pop()
     return result
 
-def print_dependency_graph(graph, root_package):
-    """Вывод графа зависимостей в текстовом формате"""
-    def print_node(package, indent="", visited=None):
-        if visited is None:
-            visited = set()
-        if package in visited:
-            return
-        visited.add(package)
-        print(f"{indent}{package}")
-        for dep in graph.get(package, []):
-            print_node(dep, indent + "  ├── ", visited)
+def topological_sort(graph, start_node, filter_substring):
+    """Топологическая сортировка для определения порядка установки"""
+    in_degree = {}
+    for node in graph:
+        in_degree[node] = 0
     
+    # Вычисление степеней захода
+    for node, deps in graph.items():
+        for dep in deps:
+            if dep in in_degree:
+                in_degree[dep] += 1
+            else:
+                in_degree[dep] = 1
+    
+    # Очередь для Kahn's algorithm
+    queue = deque()
+    if start_node in in_degree and in_degree[start_node] == 0:
+        queue.append(start_node)
+    
+    # Фильтрация начального узла
+    if filter_substring and filter_substring.lower() in start_node.lower():
+        return []
+    
+    # BFS для топологической сортировки
+    result = []
+    while queue:
+        node = queue.popleft()
+        result.append(node)
+        
+        for neighbor in graph.get(node, []):
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                if not (filter_substring and filter_substring.lower() in neighbor.lower()):
+                    queue.append(neighbor)
+    
+    return result
+
+def print_dependency_graph(graph, root_package, show_install_order=False, filter_substring=""):
+    """Вывод графа зависимостей и порядка установки"""
+    # Вывод структуры графа
     print(f"\nГРАФ ЗАВИСИМОСТЕЙ ДЛЯ {root_package}:")
-    print_node(root_package)
-    print("\nСтруктура графа (ребра):")
-    for pkg, deps in graph.items():
-        if deps:
-            print(f"{pkg} -> {', '.join(deps)}")
+    visited = set()
+    stack = [(root_package, 0)]
+    
+    while stack:
+        pkg, level = stack.pop()
+        if pkg in visited:
+            continue
+        visited.add(pkg)
+        
+        indent = "  " * level + ("└── " if level > 0 else "")
+        print(f"{indent}{pkg}")
+        
+        # Добавляем зависимости в обратном порядке для правильного отображения
+        for dep in reversed(graph.get(pkg, [])):
+            if dep not in visited:
+                stack.append((dep, level + 1))
+    
+    # Вывод порядка установки
+    if show_install_order:
+        install_order = topological_sort(graph, root_package, filter_substring)
+        
+        print("\nПОРЯДОК УСТАНОВКИ ЗАВИСИМОСТЕЙ:")
+        if install_order:
+            for i, pkg in enumerate(install_order, 1):
+                print(f"{i}. {pkg}")
+            
+            print("\nСРАВНЕНИЕ С РЕАЛЬНЫМ МЕНЕДЖЕРОМ ПАКЕТОВ (apt):")
+            print("1. Наш алгоритм учитывает ТОЛЬКО обязательные зависимости (Depends)")
+            print("2. apt также учитывает рекомендации (Recommends) и предложения (Suggests)")
+            print("3. apt разрешает альтернативные зависимости на основе приоритетов пакетов")
+            print("4. Наш алгоритм не учитывает уже установленные пакеты в системе")
+            print("5. apt может менять порядок для разрешения конфликтов версий")
+        else:
+            print("\nПОРЯДОК УСТАНОВКИ: Невозможно определить из-за фильтрации или циклов")
 
 def validate_arguments(args):
     """Валидация аргументов"""
@@ -157,14 +215,14 @@ def validate_arguments(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Построение графа зависимостей пакетов',
+        description='Построение графа зависимостей и определение порядка установки',
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False
     )
     
     # Обработка справки
     if '-h' in sys.argv or '--help' in sys.argv:
-        print("Использование: app.py --package_name <имя> --repo_url <url/путь> [--version <версия>] --mode <режим> [--filter_substring <подстрока>]")
+        print("Использование: app.py --package_name <имя> --repo_url <url/путь> [--version <версия>] --mode <режим> [--filter_substring <подстрока>] [--show_install_order]")
         print("\nОбязательные параметры:")
         print("  --package_name <имя>          Имя корневого пакета")
         print("  --repo_url <url/путь>         URL репозитория или путь к файлу")
@@ -174,6 +232,7 @@ def main():
         print("\nДополнительные параметры:")
         print("  --version <версия>            Версия пакета (только для реального режима)")
         print("  --filter_substring <строка>   Исключить пакеты, содержащие подстроку")
+        print("  --show_install_order          Показать порядок установки зависимостей")
         print("  -h, --help                    Показать справку")
         sys.exit(0)
     
@@ -183,6 +242,7 @@ def main():
     parser.add_argument('--mode', type=str, choices=['download', 'test'], required=True)
     parser.add_argument('--version', type=str)
     parser.add_argument('--filter_substring', type=str, default='')
+    parser.add_argument('--show_install_order', action='store_true')
     
     # Парсинг
     try:
@@ -238,7 +298,7 @@ def main():
         )
         
         # Вывод результата
-        print_dependency_graph(full_graph, root_package)
+        print_dependency_graph(full_graph, root_package, args.show_install_order, args.filter_substring)
         print(f"\nГраф успешно построен! Всего узлов: {len(full_graph)}")
     
     except Exception as e:
